@@ -1,0 +1,11 @@
+Architecture.md
+/.envs
+__pycache__/
+*.pyc
+**versions/
+**assets/
+u_chatbot_venv/*
+app/models/*
+tests/*
+scripts/*
+data/*
