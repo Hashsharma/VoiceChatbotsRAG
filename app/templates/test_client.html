@@ -14,90 +14,139 @@
     <div id="messages"></div>
     <audio id="audioPlayer" controls></audio>
     
-    <script>
-        let ws;
-        let mediaRecorder;
-        let audioChunks = [];
-        
-        // Connect to WebSocket
-        function connect() {
-            ws = new WebSocket('ws://localhost:8000/api/v1/ws/voice');
+   <script>
+let ws;
+let mediaRecorder;
+let audioChunks = [];
+let audioContext;
+let sourceNode;
+
+// Connect to WebSocket
+function connect() {
+    ws = new WebSocket('ws://localhost:8000/api/v1/ws/voice');
+    
+    ws.onopen = () => {
+        console.log('WebSocket connected');
+        document.getElementById('status').textContent = 'Status: Connected';
+    };
+    
+    ws.onmessage = (event) => {
+        try {
+            const data = JSON.parse(event.data);
             
-            ws.onopen = () => {
-                document.getElementById('status').textContent = 'Status: Connected';
-            };
-            
-            ws.onmessage = (event) => {
-                const data = JSON.parse(event.data);
-                
-                if (data.type === 'text') {
-                    const messagesDiv = document.getElementById('messages');
-                    messagesDiv.innerHTML += `<p><strong>Bot:</strong> ${data.content}</p>`;
-                } else if (data.type === 'audio') {
-                    // Convert hex to bytes
-                    const byteArray = new Uint8Array(data.data.match(/.{1,2}/g).map(byte => parseInt(byte, 16)));
-                    
-                    // Create audio blob and play
-                    const blob = new Blob([byteArray], { type: 'audio/wav' });
-                    const audioUrl = URL.createObjectURL(blob);
-                    const audioPlayer = document.getElementById('audioPlayer');
-                    audioPlayer.src = audioUrl;
-                    audioPlayer.play();
-                }
-            };
-            
-            ws.onclose = () => {
-                document.getElementById('status').textContent = 'Status: Disconnected';
-            };
+            if (data.type === 'text') {
+                const messagesDiv = document.getElementById('messages');
+                messagesDiv.innerHTML += `<p><strong>Bot:</strong> ${data.content}</p>`;
+            } else if (data.type === 'audio') {
+                // Convert hex to bytes and play
+                const byteArray = new Uint8Array(data.data.match(/.{1,2}/g).map(byte => parseInt(byte, 16)));
+                const blob = new Blob([byteArray], { type: 'audio/wav' });
+                const audioUrl = URL.createObjectURL(blob);
+                const audioPlayer = document.getElementById('audioPlayer');
+                audioPlayer.src = audioUrl;
+                audioPlayer.play();
+            }
+        } catch (e) {
+            console.log('Raw message:', event.data);
         }
+    };
+    
+    ws.onerror = (error) => {
+        console.error('WebSocket error:', error);
+        document.getElementById('status').textContent = 'Status: Error';
+    };
+    
+    ws.onclose = () => {
+        console.log('WebSocket disconnected');
+        document.getElementById('status').textContent = 'Status: Disconnected';
+    };
+}
+
+// Start recording - FIXED VERSION
+document.getElementById('startBtn').onclick = async () => {
+    try {
+        // Get microphone with specific format
+        const stream = await navigator.mediaDevices.getUserMedia({ 
+            audio: {
+                sampleRate: 16000,
+                channelCount: 1,
+                echoCancellation: true,
+                noiseSuppression: true
+            }
+        });
         
-        // Start recording
-        document.getElementById('startBtn').onclick = async () => {
-            const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-            mediaRecorder = new MediaRecorder(stream, {
-                mimeType: 'audio/webm;codecs=opus'
-            });
+        // Create audio context for processing
+        audioContext = new AudioContext({ sampleRate: 16000 });
+        sourceNode = audioContext.createMediaStreamSource(stream);
+        
+        // Create processor to convert to PCM
+        const processor = audioContext.createScriptProcessor(4096, 1, 1);
+        
+        let accumulatedPCM = new Int16Array(0);
+        
+        processor.onaudioprocess = (event) => {
+            const inputData = event.inputBuffer.getChannelData(0);
             
-            mediaRecorder.ondataavailable = (event) => {
-                if (event.data.size > 0) {
-                    // Convert to array buffer and send
-                    event.data.arrayBuffer().then(buffer => {
-                        const bytes = new Uint8Array(buffer);
-                        ws.send(bytes);
-                    });
+            // Convert float32 to int16
+            const pcmData = new Int16Array(inputData.length);
+            for (let i = 0; i < inputData.length; i++) {
+                const s = Math.max(-1, Math.min(1, inputData[i]));
+                pcmData[i] = s < 0 ? s * 32768 : s * 32767;
+            }
+            
+            // Accumulate PCM data
+            const newAccumulated = new Int16Array(accumulatedPCM.length + pcmData.length);
+            newAccumulated.set(accumulatedPCM);
+            newAccumulated.set(pcmData, accumulatedPCM.length);
+            accumulatedPCM = newAccumulated;
+            
+            // Send every ~2 seconds of audio (32000 samples at 16kHz)
+            if (accumulatedPCM.length >= 32000) {
+                if (ws.readyState === WebSocket.OPEN) {
+                    ws.send(accumulatedPCM.buffer);
+                    console.log(`Sent ${accumulatedPCM.length} PCM samples`);
                 }
-            };
-            
-            mediaRecorder.start(100); // Send data every 100ms
-            document.getElementById('startBtn').disabled = true;
-            document.getElementById('stopBtn').disabled = false;
-        };
-        
-        // Stop recording
-        document.getElementById('stopBtn').onclick = () => {
-            if (mediaRecorder) {
-                mediaRecorder.stop();
-                document.getElementById('startBtn').disabled = false;
-                document.getElementById('stopBtn').disabled = true;
+                accumulatedPCM = new Int16Array(0);
             }
         };
         
-        // Send text message
-        document.getElementById('sendTextBtn').onclick = () => {
-            const text = document.getElementById('textInput').value;
-            if (text && ws.readyState === WebSocket.OPEN) {
-                ws.send(JSON.stringify({
-                    type: 'text',
-                    content: text
-                }));
-                document.getElementById('messages').innerHTML += 
-                    `<p><strong>You:</strong> ${text}</p>`;
-                document.getElementById('textInput').value = '';
-            }
-        };
+        // Connect nodes
+        sourceNode.connect(processor);
+        processor.connect(audioContext.destination);
         
-        // Connect on page load
-        window.onload = connect;
-    </script>
+        // Also use MediaRecorder for UI feedback
+        mediaRecorder = new MediaRecorder(stream, {
+            mimeType: 'audio/webm;codecs=opus'
+        });
+        
+        mediaRecorder.start();
+        document.getElementById('startBtn').disabled = true;
+        document.getElementById('stopBtn').disabled = false;
+        
+        console.log('Recording started with PCM conversion');
+        
+    } catch (error) {
+        console.error('Error accessing microphone:', error);
+        alert('Microphone access denied or not available');
+    }
+};
+
+// Stop recording
+document.getElementById('stopBtn').onclick = () => {
+    if (audioContext) {
+        audioContext.close();
+    }
+    if (mediaRecorder && mediaRecorder.state !== 'inactive') {
+        mediaRecorder.stop();
+        mediaRecorder.stream.getTracks().forEach(track => track.stop());
+        document.getElementById('startBtn').disabled = false;
+        document.getElementById('stopBtn').disabled = true;
+        console.log('Recording stopped');
+    }
+};
+
+// Connect on page load
+window.onload = connect;
+</script>
 </body>
 </html>

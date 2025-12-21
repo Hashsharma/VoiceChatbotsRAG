@@ -9,63 +9,35 @@ import logging
 router = APIRouter()
 logger = logging.getLogger(__name__)
 
-'''
-    Think of it as the centralized control room or switchboard operator for a multi-user voice application. It's responsible for keeping track of all active users/sessions and managing their voice processing pipelines.
-
-    The Core Problem It Solves
-    When you build a voice application that serves multiple users simultaneously (like a voice chat app, customer service bot, or multiplayer game with voice AI), you need to:
-    Keep track of who's connected
-    Maintain their individual state/conversation history
-    Ensure their audio streams don't get mixed up
-
-    Clean up resources when they disconnect
-    ConnectionManager = The call center's main switchboard and supervisor
-    active_connections = The board showing which operators are talking to which customers
-    VoiceOrchestrator = The trained operator who knows how to handle calls
-    AudioProcessor = The noise-cancelling headphones all operators use
-
-    "user_123": {
-        "websocket": ws_object,
-        "conversation_history": [...],
-        "voice_settings": {...},
-        "last_active": timestamp
-    },
-
-'''
-
 class ConnectionManager:
     def __init__(self):
         self.active_connections = {}
         self.orchestrator = VoiceOrchestrator()
         self.audio_processor = AudioProcessor()
         
-    async def connect(self, websocket: WebSocket, client_id: str):
-        await websocket.accept()
-        self.active_connections[client_id] = websocket
-        logger.info(f"Client {client_id} connected")
-        
-    def disconnect(self, client_id: str):
-        if client_id in self.active_connections:
-            del self.active_connections[client_id]
-            logger.info(f"Client {client_id} disconnected")
+    async def send_text(self, client_id: str, text: str):
+        """Send text message to client"""
+        websocket = self.active_connections.get(client_id)
+        if websocket:
+            try:
+                # Send directly via websocket
+                await websocket.send_text(text)
+            except Exception as e:
+                logger.error(f"Error sending text to {client_id}: {e}")
     
     async def send_audio(self, client_id: str, audio_data: bytes):
-        if client_id in self.active_connections:
-            message = AudioMessage(
-                type="audio",
-                data=audio_data.hex(),
-                format="pcm_16000"
-            )
-            await self.active_connections[client_id].send_json(message.dict())
-    
-    async def send_text(self, client_id: str, text: str):
-        if client_id in self.active_connections:
-            message = TextMessage(
-                type="text",
-                content=text,
-                timestamp=asyncio.get_event_loop().time()
-            )
-            await self.active_connections[client_id].send_json(message.dict())
+        """Send audio message to client"""
+        websocket = self.active_connections.get(client_id)
+        if websocket:
+            try:
+                audio_message = {
+                    "type": "audio",
+                    "data": audio_data.hex(),
+                    "format": "wav"
+                }
+                await websocket.send_json(audio_message)
+            except Exception as e:
+                logger.error(f"Error sending audio to {client_id}: {e}")
 
 manager = ConnectionManager()
 
@@ -73,87 +45,113 @@ manager = ConnectionManager()
 async def voice_websocket(websocket: WebSocket):
     client_id = f"client_{id(websocket)}"
     
+    # Accept the connection FIRST
+    await websocket.accept()
+    
     # Buffer for accumulating audio chunks
     audio_buffer = bytearray()
-    buffer_size = 0
-    max_buffer_size = 5 * 16000 * 2  # 5 seconds of 16kHz, 16-bit audio
+    max_buffer_size = 5 * 16000 * 2
     
     # Conversation state
     is_speaking = False
     silence_counter = 0
-    silence_threshold = 10  # Number of silent chunks before processing
+    silence_threshold = 10
     
-    await manager.connect(websocket, client_id)
+    # Register with manager (AFTER accept)
+    manager.active_connections[client_id] = websocket
+    logger.info(f"Client {client_id} connected")
     
     try:
-        # Send welcome message
+        # Send welcome message (AFTER connection is accepted)
         await manager.send_text(client_id, "Connected to voice chat. Start speaking...")
         
         while True:
-            # Receive message from client
             try:
-                data = await websocket.receive()
-            except Exception as e:
-                logger.error(f"Error receiving data: {e}")
-                break
+                # Receive message
+                message = await websocket.receive()
                 
-            # Handle different message types
-            if "text" in data:
-                # Text message (for testing or fallback)
-                text_data = json.loads(data["text"])
-                await handle_text_message(text_data, client_id)
+                # Handle connection message
+                if message.get("type") == "websocket.connect":
+                    # Already handled by websocket.accept()
+                    continue
                 
-            elif "bytes" in data:
-                # Audio bytes (main voice communication)
-                audio_chunk = data["bytes"]
+                # Handle disconnect
+                if message.get("type") == "websocket.disconnect":
+                    logger.info(f"Client {client_id} requested disconnect")
+                    break
                 
-                # Process audio chunk
-                processed_chunk = await manager.audio_processor.process_chunk(audio_chunk)
+                # Handle text messages
+                if "text" in message:
+                    try:
+                        data = json.loads(message["text"])
+                        await handle_text_message(data, client_id)
+                    except json.JSONDecodeError:
+                        logger.warning(f"Invalid JSON from {client_id}: {message['text']}")
+                        # Use direct websocket.send_text() instead of manager method
+                        await websocket.send_text("Invalid message format")
                 
-                # Add VAD (Voice Activity Detection) - simple energy-based
-                has_voice = await manager.audio_processor.detect_voice(processed_chunk)
-                
-                if has_voice:
-                    audio_buffer.extend(processed_chunk)
-                    silence_counter = 0
-                    is_speaking = True
+                # Handle binary audio data
+                elif "bytes" in message:
+                    audio_chunk = message["bytes"]
+                    logger.debug(f"Received audio chunk of {len(audio_chunk)} bytes from {client_id}")
                     
-                    # Send back listening indicator
-                    await manager.send_text(client_id, "Listening...")
-                    
-                else:
-                    silence_counter += 1
-                    
-                    # If we were speaking and now have silence, process the audio
-                    if is_speaking and silence_counter >= silence_threshold:
-                        if len(audio_buffer) > 0:
-                            # Process the accumulated audio
-                            await process_audio_buffer(audio_buffer, client_id)
+                    # Process audio if processor is available
+                    if hasattr(manager, 'audio_processor') and manager.audio_processor:
+                        try:
+                            processed_chunk = await manager.audio_processor.process_chunk(audio_chunk)
                             
-                            # Clear buffer
-                            audio_buffer.clear()
-                            buffer_size = 0
-                            is_speaking = False
-                        
-                        silence_counter = 0
+                            # Voice activity detection
+                            has_voice = await manager.audio_processor.detect_voice(processed_chunk)
+                            
+                            if has_voice:
+                                audio_buffer.extend(processed_chunk)
+                                silence_counter = 0
+                                is_speaking = True
+                                
+                                # Send feedback
+                                # await websocket.send_text("👂 Listening...")
+                                
+                            else:
+                                silence_counter += 1
+                                
+                                # Process when speech ends
+                                if is_speaking and silence_counter >= silence_threshold:
+                                    if len(audio_buffer) > 0:
+                                        await process_audio_buffer(audio_buffer, client_id)
+                                        audio_buffer.clear()
+                                        is_speaking = False
+                                    silence_counter = 0
+                            
+                            # Prevent buffer overflow
+                            if len(audio_buffer) > max_buffer_size:
+                                await websocket.send_text("Processing long audio...")
+                                await process_audio_buffer(audio_buffer, client_id)
+                                audio_buffer.clear()
+                                is_speaking = False
+                                
+                        except Exception as e:
+                            logger.error(f"Error processing audio: {e}")
+                            await websocket.send_text("Error processing audio")
+                    else:
+                        await websocket.send_text("Audio processor not available")
                 
-                # Prevent buffer from growing too large
-                if len(audio_buffer) > max_buffer_size:
-                    # Force process if buffer is too full
-                    await process_audio_buffer(audio_buffer, client_id)
-                    audio_buffer.clear()
-                    buffer_size = 0
-                    is_speaking = False
-            
-            elif data.get("type") == "websocket.disconnect":
+                else:
+                    logger.warning(f"Unexpected message format: {message}")
+                    
+            except WebSocketDisconnect:
+                logger.info(f"Client {client_id} disconnected")
+                break
+            except Exception as e:
+                logger.error(f"Error processing message: {e}")
                 break
                 
-    except WebSocketDisconnect:
-        logger.info(f"Client {client_id} disconnected normally")
     except Exception as e:
-        logger.error(f"WebSocket error for client {client_id}: {str(e)}")
+        logger.error(f"WebSocket error: {str(e)}", exc_info=True)
     finally:
-        manager.disconnect(client_id)
+        # Clean up
+        if client_id in manager.active_connections:
+            del manager.active_connections[client_id]
+        logger.info(f"Client {client_id} disconnected")
 
 async def process_audio_buffer(audio_buffer: bytearray, client_id: str):
     """Process accumulated audio buffer through STT → LLM → TTS pipeline."""
@@ -161,43 +159,52 @@ async def process_audio_buffer(audio_buffer: bytearray, client_id: str):
         return
     
     try:
-        logger.info(f"Processing audio buffer of size {len(audio_buffer)} bytes")
+        logger.info(f"Processing audio buffer of size {len(audio_buffer)} bytes for {client_id}")
         
-        # Step 1: Convert audio to text (STT)
-        await manager.send_text(client_id, "Processing speech...")
-        text = await manager.orchestrator.speech_to_text(bytes(audio_buffer))
-        logger.info(f"STT Result: {text}")
-        
-        if not text or len(text.strip()) < 2:
-            await manager.send_text(client_id, "I didn't catch that. Could you repeat?")
+        # Get the websocket directly
+        websocket = manager.active_connections.get(client_id)
+        if not websocket:
+            logger.error(f"No active connection for {client_id}")
             return
         
-        await manager.send_text(client_id, f"You said: {text}")
+        # Step 1: Convert audio to text (STT)
+        await websocket.send_text("🔄 Processing speech...")
+        
+        # Call your STT service
+        text = await manager.orchestrator.speech_to_text(bytes(audio_buffer))
+        
+        if not text or len(text.strip()) < 2:
+            await websocket.send_text("❓ I didn't catch that. Could you repeat?")
+            return
+        
+        await websocket.send_text(f"🗣️ You said: {text}")
         
         # Step 2: Get response from LLM
-        await manager.send_text(client_id, "Thinking...")
-        response_text = await manager.orchestrator.get_llm_response(text)
+        await websocket.send_text("🤔 Thinking...")
+        response_text = await manager.orchestrator.get_llm_response(text, client_id)
         
         # Step 3: Convert response to speech (TTS)
-        await manager.send_text(client_id, "Generating audio response...")
+        await websocket.send_text("🎵 Generating audio response...")
         audio_response = await manager.orchestrator.text_to_speech(response_text)
         
         # Step 4: Send audio response back
-        await manager.send_text(client_id, f"Assistant: {response_text}")
-        await manager.send_audio(client_id, audio_response)
+        await websocket.send_text(f"🤖 Assistant: {response_text}")
         
-        logger.info("Audio processing completed successfully")
+        # Send audio as JSON
+        audio_message = {
+            "type": "audio",
+            "data": audio_response.hex() if hasattr(audio_response, 'hex') else audio_response,
+            "format": "wav"
+        }
+        await websocket.send_json(audio_message)
+        
+        logger.info(f"Audio processing completed for {client_id}")
         
     except Exception as e:
-        logger.error(f"Error processing audio: {str(e)}")
-        await manager.send_text(client_id, "Sorry, I encountered an error processing your request.")
-        
-        # Fallback: Send text response if TTS fails
-        try:
-            response_text = "I apologize, but I'm having trouble with voice synthesis. Here's my text response."
-            await manager.send_text(client_id, response_text)
-        except:
-            pass
+        logger.error(f"Error processing audio: {str(e)}", exc_info=True)
+        websocket = manager.active_connections.get(client_id)
+        if websocket:
+            await websocket.send_text("⚠️ Sorry, I encountered an error processing your request.")
 
 async def handle_text_message(data: dict, client_id: str):
     """Handle text messages (for testing or fallback mode)."""
@@ -209,18 +216,20 @@ async def handle_text_message(data: dict, client_id: str):
             control_msg = ControlMessage(**data)
             
             if control_msg.command == "start_recording":
-                await manager.send_text(client_id, "Recording started...")
+                await manager.send_text(client_id, "🎤 Recording started...")
             elif control_msg.command == "stop_recording":
-                await manager.send_text(client_id, "Recording stopped.")
+                await manager.send_text(client_id, "⏹️ Recording stopped.")
             elif control_msg.command == "reset":
-                await manager.send_text(client_id, "Conversation reset.")
+                await manager.send_text(client_id, "🔄 Conversation reset.")
                 await manager.orchestrator.reset_conversation(client_id)
+            elif control_msg.command == "ping":
+                await manager.send_text(client_id, "🏓 pong")
                 
         elif message_type == "text":
             # Direct text input (bypass STT)
             text_msg = TextMessage(**data)
-            response_text = await manager.orchestrator.get_llm_response(text_msg.content)
-            await manager.send_text(client_id, f"Assistant: {response_text}")
+            response_text = await manager.orchestrator.get_llm_response(text_msg.content, client_id)
+            await manager.send_text(client_id, f"🤖 Assistant: {response_text}")
             
             # Optional: Also send TTS response
             try:
@@ -230,5 +239,5 @@ async def handle_text_message(data: dict, client_id: str):
                 logger.warning(f"TTS failed for text message: {e}")
                 
     except Exception as e:
-        logger.error(f"Error handling text message: {str(e)}")
-        await manager.send_text(client_id, f"Error: {str(e)}")
+        logger.error(f"Error handling text message: {str(e)}", exc_info=True)
+        await manager.send_text(client_id, f"⚠️ Error: {str(e)}")
