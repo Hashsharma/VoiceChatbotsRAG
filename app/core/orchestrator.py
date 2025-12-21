@@ -1,45 +1,93 @@
 import asyncio
 import whisper
 import pyttsx3
-import io
-from typing import Optional
-from transformers import WhisperProcessor, WhisperForConditionalGeneration
+import numpy as np
 from pathlib import Path
 
 
 class VoiceOrchestrator:
-    def __init__(self):
-        # Path to your local Whisper model
-        base_dir = Path(__file__).resolve().parent
-        model_path = base_dir / "../models/stt_models/whisper"
-
-        # Initialize STT (Hugging Face Whisper)
-        self.stt_processor = WhisperProcessor.from_pretrained(model_path)
-        self.stt_model = WhisperForConditionalGeneration.from_pretrained(model_path)
-
-        # Initialize TTS (pyttsx3)
-        self.tts_engine = pyttsx3.init()
-        self.tts_engine.setProperty('rate', 150)  # Speed percent
-
-        # Simple conversation memory
-        self.conversation_history = []
+    def __init__(self, model_size="base"):
+        """
+        Use locally stored Whisper models.
         
-    async def speech_to_text(self, audio_bytes: bytes) -> str:
+        Args:
+            model_size: "tiny", "base", "small", "medium", "large"
+        """
+        base_dir = Path(__file__).resolve().parent.parent
+        model_path = base_dir / "models" / "stt_models" / "whisper"
+        
+        print(f"Loading Whisper {model_size} model from {model_path}...")
+        
+        # Load model from local directory
+        try:
+            self.stt_model = whisper.load_model(
+                model_size, 
+                download_root=str(model_path)
+            )
+            print(f"✓ Whisper model loaded from local cache")
+        except Exception as e:
+            print(f"Error loading local model: {e}")
+            print("Falling back to online download...")
+            self.stt_model = whisper.load_model(model_size)
+        
+        # Initialize TTS
+        try:
+            self.tts_engine = pyttsx3.init()
+            self.tts_engine.setProperty('rate', 150)
+            print("✓ TTS engine initialized")
+        except Exception as e:
+            print(f"TTS Error: {e}")
+            self.tts_engine = None
+        
+        self.conversation_history = []
+
+    async def speech_to_text(self, audio_bytes: bytes, sample_rate: int = 16000) -> str:
         """Convert audio to text using Whisper."""
         try:
-            # Load audio
-            import numpy as np
-            import wave
+            # Method 1: Convert bytes directly to numpy array (Recommended)
+            # Assuming audio is 16-bit PCM, mono
+            audio_array = np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32) / 32768.0
             
-            # Convert bytes to numpy array
-            audio_stream = io.BytesIO(audio_bytes)
+            # Transcribe using Whisper
+            result = self.stt_model.transcribe(
+                audio_array,
+                fp16=False,  # Use float32 for CPU
+                language="en",
+                task="transcribe"
+            )
             
-            # Use Whisper
-            result = self.stt_model.transcribe(audio_stream.name)
-            return result["text"]
+            text = result["text"].strip()
+            print(f"STT Result: '{text}'")
+            return text
             
         except Exception as e:
             print(f"STT Error: {e}")
+            return ""
+
+    # Alternative method if you need to handle WAV files
+    async def speech_to_text_from_wav(self, audio_bytes: bytes) -> str:
+        """Alternative method for WAV formatted audio."""
+        try:
+            # Save bytes to temporary file
+            import tempfile
+            import os
+            
+            with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as tmpfile:
+                tmp_path = tmpfile.name
+                tmpfile.write(audio_bytes)
+            
+            # Transcribe from file
+            result = self.stt_model.transcribe(tmp_path)
+            
+            # Clean up temp file
+            os.unlink(tmp_path)
+            
+            text = result["text"].strip()
+            print(f"STT Result: '{text}'")
+            return text
+            
+        except Exception as e:
+            print(f"STT Error (WAV method): {e}")
             return ""
     
     async def get_llm_response(self, user_input: str) -> str:
