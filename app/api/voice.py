@@ -45,113 +45,116 @@ manager = ConnectionManager()
 async def voice_websocket(websocket: WebSocket):
     client_id = f"client_{id(websocket)}"
     
-    # Accept the connection FIRST
+    # Accept the connection
     await websocket.accept()
+    logger.info(f"✅ Client {client_id} connected")
     
-    # Buffer for accumulating audio chunks
-    audio_buffer = bytearray()
-    max_buffer_size = 5 * 16000 * 2
-    
-    # Conversation state
-    is_speaking = False
-    silence_counter = 0
-    silence_threshold = 10
-    
-    # Register with manager (AFTER accept)
+    # Store connection
     manager.active_connections[client_id] = websocket
-    logger.info(f"Client {client_id} connected")
+    
+    # Buffer for audio chunks
+    audio_buffer = bytearray()
+    last_audio_time = asyncio.get_event_loop().time()
+    
+    # Send welcome message
+    await websocket.send_text("✅ Connected to voice assistant. Click 'Start Listening' to begin.")
     
     try:
-        # Send welcome message (AFTER connection is accepted)
-        await manager.send_text(client_id, "Connected to voice chat. Start speaking...")
-        
         while True:
             try:
-                # Receive message
-                message = await websocket.receive()
-                
-                # Handle connection message
-                if message.get("type") == "websocket.connect":
-                    # Already handled by websocket.accept()
-                    continue
-                
-                # Handle disconnect
-                if message.get("type") == "websocket.disconnect":
-                    logger.info(f"Client {client_id} requested disconnect")
-                    break
+                # Receive message with timeout
+                message = await asyncio.wait_for(websocket.receive(), timeout=30.0)
                 
                 # Handle text messages
                 if "text" in message:
+                    text_data = message["text"]
+                    logger.info(f"📝 Received text from {client_id}: {text_data}")
+                    
                     try:
-                        data = json.loads(message["text"])
-                        await handle_text_message(data, client_id)
+                        # Try to parse as JSON
+                        data = json.loads(text_data)
+                        
+                        if data.get("type") == "connection":
+                            await websocket.send_json({
+                                "type": "text",
+                                "message": f"Welcome {data.get('client', 'client')}!"
+                            })
+                        elif data.get("type") == "control" and data.get("command") == "reset":
+                            audio_buffer.clear()
+                            await websocket.send_text("🔄 Conversation reset")
+                        else:
+                            await websocket.send_text(f"📨 Received: {data}")
+                            
                     except json.JSONDecodeError:
-                        logger.warning(f"Invalid JSON from {client_id}: {message['text']}")
-                        # Use direct websocket.send_text() instead of manager method
-                        await websocket.send_text("Invalid message format")
+                        # Plain text message
+                        await websocket.send_text(f"📨 You said: {text_data}")
                 
                 # Handle binary audio data
                 elif "bytes" in message:
                     audio_chunk = message["bytes"]
-                    logger.debug(f"Received audio chunk of {len(audio_chunk)} bytes from {client_id}")
+                    logger.info(f"🎵 Received audio chunk from {client_id}: {len(audio_chunk)} bytes")
+                    last_audio_time = asyncio.get_event_loop().time()
                     
-                    # Process audio if processor is available
-                    if hasattr(manager, 'audio_processor') and manager.audio_processor:
-                        try:
-                            processed_chunk = await manager.audio_processor.process_chunk(audio_chunk)
-                            
-                            # Voice activity detection
-                            has_voice = await manager.audio_processor.detect_voice(processed_chunk)
-                            
-                            if has_voice:
-                                audio_buffer.extend(processed_chunk)
-                                silence_counter = 0
-                                is_speaking = True
-                                
-                                # Send feedback
-                                # await websocket.send_text("👂 Listening...")
-                                
-                            else:
-                                silence_counter += 1
-                                
-                                # Process when speech ends
-                                if is_speaking and silence_counter >= silence_threshold:
-                                    if len(audio_buffer) > 0:
-                                        await process_audio_buffer(audio_buffer, client_id)
-                                        audio_buffer.clear()
-                                        is_speaking = False
-                                    silence_counter = 0
-                            
-                            # Prevent buffer overflow
-                            if len(audio_buffer) > max_buffer_size:
-                                await websocket.send_text("Processing long audio...")
+                    # Add to buffer
+                    audio_buffer.extend(audio_chunk)
+                    
+                    # Check if this is a complete recording (larger chunk)
+                    if len(audio_chunk) > 10000:  # Larger chunks indicate final audio
+                        logger.info(f"🎤 Large audio chunk received ({len(audio_chunk)} bytes), processing...")
+                        await websocket.send_text("🔄 Processing your audio...")
+                        
+                        # Process the audio
+                        if len(audio_buffer) > 0:
+                            try:
                                 await process_audio_buffer(audio_buffer, client_id)
                                 audio_buffer.clear()
-                                is_speaking = False
-                                
-                        except Exception as e:
-                            logger.error(f"Error processing audio: {e}")
-                            await websocket.send_text("Error processing audio")
+                            except Exception as e:
+                                logger.error(f"Error processing audio: {e}")
+                                await websocket.send_text("❌ Error processing audio")
                     else:
-                        await websocket.send_text("Audio processor not available")
+                        # Small chunk, just acknowledge
+                        if len(audio_buffer) % 100000 < len(audio_chunk):  # Log every ~100KB
+                            await websocket.send_text(f"👂 Listening... ({len(audio_buffer)//1000}KB)")
                 
                 else:
-                    logger.warning(f"Unexpected message format: {message}")
+                    logger.warning(f"Unexpected message format from {client_id}")
                     
+            except asyncio.TimeoutError:
+                # Check if we have buffered audio to process
+                current_time = asyncio.get_event_loop().time()
+                if len(audio_buffer) > 0 and (current_time - last_audio_time) > 2.0:
+                    # 2 seconds of silence, process buffered audio
+                    logger.info(f"⏱️ Silence detected, processing buffered audio ({len(audio_buffer)} bytes)")
+                    await websocket.send_text("🔄 Processing...")
+                    
+                    if len(audio_buffer) > 0:
+                        try:
+                            await process_audio_buffer(audio_buffer, client_id)
+                            audio_buffer.clear()
+                        except Exception as e:
+                            logger.error(f"Error processing audio: {e}")
+                            await websocket.send_text("❌ Error processing audio")
+                
+                # Send keep-alive
+                await websocket.send_json({
+                    "type": "ping",
+                    "timestamp": asyncio.get_event_loop().time()
+                })
+                
             except WebSocketDisconnect:
-                logger.info(f"Client {client_id} disconnected")
+                logger.info(f"🔌 Client {client_id} disconnected")
                 break
             except Exception as e:
-                logger.error(f"Error processing message: {e}")
-                break
+                logger.error(f"❌ Error processing message from {client_id}: {e}")
+                await websocket.send_text(f"❌ Error: {str(e)}")
                 
     except Exception as e:
-        logger.error(f"WebSocket error: {str(e)}", exc_info=True)
+        logger.error(f"💥 WebSocket error for {client_id}: {str(e)}", exc_info=True)
     finally:
         # Clean up
         if client_id in manager.active_connections:
             del manager.active_connections[client_id]
-        logger.info(f"Client {client_id} disconnected")
+        logger.info(f"👋 Client {client_id} disconnected completely")
 
 async def process_audio_buffer(audio_buffer: bytearray, client_id: str):
     """Process accumulated audio buffer through STT → LLM → TTS pipeline."""
@@ -159,25 +162,25 @@ async def process_audio_buffer(audio_buffer: bytearray, client_id: str):
         return
     
     try:
-        logger.info(f"Processing audio buffer of size {len(audio_buffer)} bytes for {client_id}")
+        logger.info(f"🔄 Processing audio buffer of size {len(audio_buffer)} bytes for {client_id}")
         
-        # Get the websocket directly
+        # Get the websocket
         websocket = manager.active_connections.get(client_id)
         if not websocket:
             logger.error(f"No active connection for {client_id}")
             return
         
         # Step 1: Convert audio to text (STT)
-        await websocket.send_text("🔄 Processing speech...")
+        await websocket.send_text("🗣️ Converting speech to text...")
         
-        # Call your STT service
+        # Call your STT service - use bytes() instead of bytearray
         text = await manager.orchestrator.speech_to_text(bytes(audio_buffer))
         
         if not text or len(text.strip()) < 2:
             await websocket.send_text("❓ I didn't catch that. Could you repeat?")
             return
         
-        await websocket.send_text(f"🗣️ You said: {text}")
+        await websocket.send_text(f"📝 You said: {text}")
         
         # Step 2: Get response from LLM
         await websocket.send_text("🤔 Thinking...")
@@ -190,21 +193,17 @@ async def process_audio_buffer(audio_buffer: bytearray, client_id: str):
         # Step 4: Send audio response back
         await websocket.send_text(f"🤖 Assistant: {response_text}")
         
-        # Send audio as JSON
-        audio_message = {
-            "type": "audio",
-            "data": audio_response.hex() if hasattr(audio_response, 'hex') else audio_response,
-            "format": "wav"
-        }
-        await websocket.send_json(audio_message)
+        # Send audio as binary data (more efficient than hex encoding)
+        await websocket.send_bytes(audio_response)
         
-        logger.info(f"Audio processing completed for {client_id}")
+        logger.info(f"✅ Audio processing completed for {client_id}")
         
     except Exception as e:
-        logger.error(f"Error processing audio: {str(e)}", exc_info=True)
+        logger.error(f"❌ Error processing audio: {str(e)}", exc_info=True)
         websocket = manager.active_connections.get(client_id)
         if websocket:
             await websocket.send_text("⚠️ Sorry, I encountered an error processing your request.")
+            
 
 async def handle_text_message(data: dict, client_id: str):
     """Handle text messages (for testing or fallback mode)."""
