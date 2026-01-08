@@ -127,7 +127,7 @@ class VoiceOrchestrator:
             # Use the fast voice engine
             audio_bytes = await self.voice_engine.synthesize(
                 text=text,
-                language=language,
+                # language=language,
                 speed=speed
             )
             
