@@ -25,6 +25,38 @@ class FastVoiceEngine:
         self.model_dir = Path(__file__).parent / "xtts_models"
         self.model_dir.mkdir(exist_ok=True)
         
+        # Initialize Piper voice if available
+        self.piper_voice = None
+        self._initialize_piper()
+
+    def _initialize_piper(self):
+        """Initialize Piper TTS if available"""
+        try:
+            from piper import PiperVoice
+            
+            # Try to load your existing Piper model
+            model_path = "/media/scientist-anand/volume/mr_document/Linux_Git/VoiceChatbotsRAG/app/models/tts_models/pipper-ttss/en_US-lessac-medium.onnx"
+            config_path = "/media/scientist-anand/volume/mr_document/Linux_Git/VoiceChatbotsRAG/app/models/tts_models/pipper-ttss/en_US-lessac-medium.onnx.json"
+            
+            if os.path.exists(model_path):
+                if os.path.exists(config_path):
+                    self.piper_voice = PiperVoice.load(
+                        model_path=model_path,
+                        config_path=config_path
+                    )
+                else:
+                    self.piper_voice = PiperVoice.load(model_path=model_path)
+                
+                print(f"✅ Piper TTS loaded from {model_path}")
+                print(f"   Sample rate: {self.piper_voice.config.sample_rate}")
+            else:
+                print("⚠️ Piper model not found, will use XTTS only")
+                
+        except ImportError:
+            print("⚠️ Piper not installed, will use XTTS only")
+        except Exception as e:
+            print(f"⚠️ Could not load Piper: {e}")
+        
     async def initialize(self, voice_file="my_voice.wav"):
         """Async initialization with GPU support"""
         if self.initialized:
@@ -184,26 +216,85 @@ class FastVoiceEngine:
                 print(f"📊 Using full precision (FP32): {e}")
     
     async def synthesize(self, text: str, language: str = "en", 
-                        temperature: float = 0.7, speed: float = 1.0) -> bytes:
-        """Async text-to-speech synthesis"""
+                     temperature: float = 0.7, speed: float = 1.0) -> bytes:
+        """Async text-to-speech synthesis - ALWAYS uses Piper if available"""
+        # ALWAYS use Piper if it's available
+        if self.piper_voice is not None:
+            print("🎯 Using Piper TTS (fast)")
+            try:
+                return await asyncio.get_event_loop().run_in_executor(
+                    self.executor,
+                    self._synthesize_with_piper_only,
+                    text, speed
+                )
+            except Exception as e:
+                print(f"❌ Piper synthesis error: {e}")
+                traceback.print_exc()
+                return b""
+        
+        # Only use XTTS if Piper is not available
+        print("⚠️ Piper not available, using XTTS")
         if not self.initialized:
             await self.initialize()
         
-        # Run synthesis in thread pool
+        # Run XTTS synthesis in thread pool
         try:
             return await asyncio.get_event_loop().run_in_executor(
                 self.executor,
-                self._synthesize_sync,
+                self._synthesize_xtts_only,
                 text, language, temperature, speed
             )
         except Exception as e:
-            print(f"❌ Synthesis error: {e}")
+            print(f"❌ XTTS synthesis error: {e}")
             traceback.print_exc()
             return b""
-    
-    def _synthesize_sync(self, text: str, language: str, 
-                         temperature: float, speed: float) -> bytes:
-        """Synchronous synthesis (runs in thread pool)"""
+
+    def _synthesize_with_piper_only(self, text: str, speed: float = 1.0) -> bytes:
+        """Use ONLY Piper TTS for faster synthesis - simplest version"""
+        try:
+            start_time = time.time()
+            
+            # Generate audio
+            audio_chunks = self.piper_voice.synthesize(text=text)
+            
+            # Collect chunks
+            chunks = list(audio_chunks)
+            
+            if not chunks:
+                return self._create_silent_audio()
+            
+            # Get sample rate and combine audio data
+            sample_rate = chunks[0].sample_rate
+            
+            # Method 1: Use _audio_int16_array if available
+            if hasattr(chunks[0], '_audio_int16_array') and chunks[0]._audio_int16_array is not None:
+                combined_audio = np.concatenate([chunk._audio_int16_array for chunk in chunks])
+            # Method 2: Convert float array to int16
+            elif hasattr(chunks[0], 'audio_float_array'):
+                combined_audio = np.concatenate([
+                    (chunk.audio_float_array * 32767).astype(np.int16) 
+                    for chunk in chunks
+                ])
+            else:
+                return self._create_silent_audio()
+            
+            # Create WAV bytes
+            wav_buffer = io.BytesIO()
+            write(wav_buffer, sample_rate, combined_audio)
+            
+            inference_time = time.time() - start_time
+            print(f"🔊 Piper: {len(text)} chars in {inference_time:.2f}s")
+            
+            return wav_buffer.getvalue()
+                    
+        except Exception as e:
+            print(f"❌ Piper TTS error: {e}")
+            traceback.print_exc()
+            return self._create_silent_audio()
+
+    def _synthesize_xtts_only(self, text: str, language: str, 
+                            temperature: float, speed: float) -> bytes:
+        """Fallback to XTTS only if Piper is not available"""
         try:
             if self.model is None:
                 raise ValueError("Model not initialized")
@@ -247,14 +338,13 @@ class FastVoiceEngine:
             write(wav_buffer, 24000, (wav_np * 32767).astype(np.int16))
             
             inference_time = time.time() - start_time
-            print(f"🔊 Synthesized {len(text)} chars in {inference_time:.2f}s")
+            print(f"🔊 XTTS: Synthesized {len(text)} chars in {inference_time:.2f}s")
             
             return wav_buffer.getvalue()
             
         except Exception as e:
-            print(f"❌ Synthesis error: {e}")
+            print(f"❌ XTTS synthesis error: {e}")
             traceback.print_exc()
-            # Return silent audio as fallback
             return self._create_silent_audio()
     
     def _create_default_voice(self, output_file="default_voice.wav"):
