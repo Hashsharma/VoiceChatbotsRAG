@@ -123,7 +123,7 @@ class VoiceOrchestrator:
             #     return b""
 
             print(f"🔊 TTS: '{text[:50]}...'")
-            text = "I m better feeling"
+            text = "I am analyzing your question please wait"
             # Use the fast voice engine
             audio_bytes = await self.voice_engine.synthesize(
                 text=text,
