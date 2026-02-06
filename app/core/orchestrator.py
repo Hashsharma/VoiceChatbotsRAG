@@ -9,6 +9,11 @@ import torch
 from scipy.io.wavfile import write
 import traceback
 from ..speech.utils.voice_engine import FastVoiceEngine  # Import our new engine
+from openai import OpenAI
+client = OpenAI(
+    base_url="http://localhost:1234/v1",
+    api_key="lm-studio"  # dummy value
+)
 
 base_dir = Path(__file__).resolve().parent.parent
 
@@ -123,7 +128,7 @@ class VoiceOrchestrator:
             #     return b""
 
             print(f"🔊 TTS: '{text[:50]}...'")
-            text = "I am analyzing your question please wait"
+            # text = f"I am analyzing your question {text} please"
             # Use the fast voice engine
             audio_bytes = await self.voice_engine.synthesize(
                 text=text,
@@ -141,20 +146,28 @@ class VoiceOrchestrator:
     
     # Keep all your existing methods unchanged...
     async def get_llm_response(self, user_input: str, client_id: str) -> str:
-        """ Get LLM response with user-specific conversation history."""
+        """Get LLM response with user-specific conversation history."""
         if client_id not in self.conversation_histories:
             self.conversation_histories[client_id] = []
-        
+
         user_history = self.conversation_histories[client_id]
-        user_history.append(f"User: {user_input}")
-        
-        response = self._generate_response(user_input, user_history)
-        user_history.append(f"Assistant: {response}")
-        
+
+        # Add user input as a structured dict
+        user_history.append({"user": user_input, "assistant": None})
+
+        # If _llm_response is sync, run in a thread
+        import asyncio
+        response = await asyncio.to_thread(self._llm_response, user_input, user_history)
+
+        # Update the last entry with assistant response
+        user_history[-1]["assistant"] = response
+
+        # Keep last 20 exchanges
         if len(user_history) > 20:
             self.conversation_histories[client_id] = user_history[-20:]
-        
+
         return response
+
     
     def _generate_response(self, user_input: str, history: list) -> str:
         """Generate response using rules or actual LLM."""
@@ -178,6 +191,28 @@ class VoiceOrchestrator:
             if len(history) > 2:
                 return f"You mentioned: '{user_input}'. Could you tell me more about that?"
             return f"I understand you said: '{user_input}'. How can I assist you further?"
+
+    def _llm_response(self, user_input: str, history: list) -> str:
+        messages = [
+            {"role": "system", "content": "You are a helpful voice assistant."}
+        ]
+
+        # Convert history to OpenAI format
+        for h in history:
+            messages.append({"role": "user", "content": h["user"]})
+            messages.append({"role": "assistant", "content": h["assistant"]})
+
+        messages.append({"role": "user", "content": user_input})
+
+        response = client.chat.completions.create(
+            model="mathstral-7b-v0.1",  # LM Studio ignores name, but it must exist
+            messages=messages,
+            temperature=0.7,
+            max_tokens=200
+        )
+
+        return response.choices[0].message.content.strip()
+
     
     def _check_conversation_context(self, history: list, current_input: str) -> str:
         """Check if current input relates to previous conversation."""
